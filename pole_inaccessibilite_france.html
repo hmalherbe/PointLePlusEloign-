@@ -1,0 +1,223 @@
+<style>
+.pi-wrap{display:flex;flex-direction:column;gap:10px;font-family:sans-serif}
+.pi-controls{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.pi-readout{font-size:14px;color:#444}
+.pi-readout b{color:#111;font-weight:600}
+.pi-hint{font-size:12px;color:#777}
+.pi-legend{font-size:12px;color:#666;display:flex;gap:16px;flex-wrap:wrap}
+.pi-legend span{display:inline-flex;align-items:center;gap:5px}
+.pi-dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+button#pi-reset{padding:6px 12px;border-radius:6px;border:1px solid #ccc;background:#fff;cursor:pointer;font-size:13px}
+button#pi-reset:hover{background:#f2f2f2}
+</style>
+<div class="pi-wrap">
+<h2 style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">Carte de France interactive : déplacez les villes pour voir le diagramme de Voronoi et le point le plus éloigné de toute ville se recalculer en direct.</h2>
+<div class="pi-controls">
+  <span class="pi-readout">Point le plus isolé : à <b id="pi-dist">--</b> du site le plus proche</span>
+  <button id="pi-reset">Réinitialiser</button>
+</div>
+<div class="pi-legend">
+  <span><span class="pi-dot" style="background:#2f6fb0"></span>Villes (déplaçables)</span>
+  <span><span class="pi-dot" style="background:#999"></span>Arêtes de Voronoi</span>
+  <span><span class="pi-dot" style="background:#d64545"></span>Point le plus éloigné</span>
+</div>
+<svg id="pi-svg" width="100%" viewBox="0 0 600 620" style="touch-action:none;background:#fff;border-radius:8px">
+<defs>
+<clipPath id="pi-clip">
+<path id="pi-mainland-clip" fill="#000"></path>
+<path id="pi-corsica-clip" fill="#000"></path>
+</clipPath>
+</defs>
+<path id="pi-mainland" fill="#dff0e2" stroke="#5a9e6f" stroke-width="1.2"></path>
+<path id="pi-corsica" fill="#dff0e2" stroke="#5a9e6f" stroke-width="1.2"></path>
+<g id="pi-voronoi" fill="none" stroke="#999" stroke-width="0.7" opacity="0.85" clip-path="url(#pi-clip)"></g>
+<circle id="pi-radius" fill="none" stroke="#d64545" stroke-width="1" stroke-dasharray="4 4"></circle>
+<circle id="pi-farthest" r="7" fill="#d64545" stroke="#fff" stroke-width="1.5"></circle>
+<g id="pi-sites"></g>
+</svg>
+<span class="pi-hint">Faites glisser un point pour déplacer une ville. Cliquez sur la carte pour en ajouter une, double-cliquez sur un point pour la supprimer.</span>
+</div>
+<script>
+(function(){
+var svg = document.getElementById('pi-svg');
+
+var mainlandPts = [[340.6,80.9],[366.2,106.0],[385.1,101.8],[417.2,126.0],[425.4,130.7],[436.0,129.5],[453.4,143.5],[506.3,153.2],[487.8,189.6],[483.1,227.5],[473.0,236.6],[456.3,231.7],[457.4,245.2],[430.6,275.1],[430.0,299.1],[447.6,290.8],[460.2,314.1],[458.7,329.1],[469.5,349.1],[456.8,365.3],[466.2,406.4],[486.1,413.1],[481.9,436.2],[448.6,466.2],[376.2,451.8],[322.7,469.1],[318.5,501.1],[275.9,508.0],[234.5,483.9],[221.2,495.4],[153.5,471.3],[138.9,450.6],[157.9,418.7],[164.9,312.8],[127.0,257.1],[99.9,230.2],[43.7,209.7],[40.0,171.0],[87.6,159.4],[149.3,173.1],[137.7,112.9],[172.4,135.7],[257.9,94.3],[269.0,50.7],[301.1,40.0],[306.4,58.7],[323.5,59.6]];
+var corsicaPts = [[560.0,518.1],[547.9,559.2],[531.2,548.4],[522.7,512.6],[530.1,492.8],[553.8,472.5]];
+
+function ringToPath(pts){
+  return 'M' + pts.map(function(p){return p[0]+','+p[1];}).join(' L') + ' Z';
+}
+document.getElementById('pi-mainland').setAttribute('d', ringToPath(mainlandPts));
+document.getElementById('pi-corsica').setAttribute('d', ringToPath(corsicaPts));
+document.getElementById('pi-mainland-clip').setAttribute('d', ringToPath(mainlandPts));
+document.getElementById('pi-corsica-clip').setAttribute('d', ringToPath(corsicaPts));
+
+var xs = mainlandPts.map(function(p){return p[0];});
+var ys = mainlandPts.map(function(p){return p[1];});
+var bbox = {minX: Math.min.apply(null,xs), maxX: Math.max.apply(null,xs), minY: Math.min.apply(null,ys), maxY: Math.max.apply(null,ys)};
+
+var defaultSites = [[295.2,161.8],[386.4,326.2],[261.8,440.9],[43.9,186.6],[321.1,67.6],[406.0,457.3],[492.3,173.8],[151.6,245.6]];
+var sites = defaultSites.map(function(p){return p.slice();});
+var dragIndex = -1;
+
+function pointInPolygon(x,y,poly){
+  var inside=false;
+  for(var i=0,j=poly.length-1;i<poly.length;j=i++){
+    var xi=poly[i][0], yi=poly[i][1], xj=poly[j][0], yj=poly[j][1];
+    var intersect = ((yi>y)!==(yj>y)) && (x < (xj-xi)*(y-yi)/(yj-yi)+xi);
+    if(intersect) inside=!inside;
+  }
+  return inside;
+}
+
+function toSvgPoint(evt){
+  var pt = svg.createSVGPoint();
+  pt.x = evt.clientX; pt.y = evt.clientY;
+  var ctm = svg.getScreenCTM().inverse();
+  return pt.matrixTransform(ctm);
+}
+
+function renderSites(){
+  var g = document.getElementById('pi-sites');
+  g.innerHTML = '';
+  sites.forEach(function(s, i){
+    var c = document.createElementNS('http://www.w3.org/2000/svg','circle');
+    c.setAttribute('cx', s[0]); c.setAttribute('cy', s[1]);
+    c.setAttribute('r', 7);
+    c.setAttribute('fill', '#2f6fb0');
+    c.setAttribute('stroke', '#fff');
+    c.setAttribute('stroke-width', '1.5');
+    c.style.cursor = 'grab';
+    c.addEventListener('pointerdown', function(evt){
+      evt.stopPropagation();
+      dragIndex = i;
+      c.setPointerCapture(evt.pointerId);
+      c.style.cursor = 'grabbing';
+    });
+    c.addEventListener('pointermove', function(evt){
+      if(dragIndex !== i) return;
+      var p = toSvgPoint(evt);
+      var x = Math.max(0, Math.min(600, p.x));
+      var y = Math.max(0, Math.min(620, p.y));
+      sites[i] = [x,y];
+      c.setAttribute('cx', x); c.setAttribute('cy', y);
+      update();
+    });
+    c.addEventListener('pointerup', function(){
+      dragIndex = -1;
+      c.style.cursor = 'grab';
+    });
+    c.addEventListener('dblclick', function(evt){
+      evt.stopPropagation();
+      if(sites.length > 2){
+        sites.splice(i,1);
+        renderSites();
+        update();
+      }
+    });
+    g.appendChild(c);
+  });
+}
+
+svg.addEventListener('click', function(evt){
+  if(evt.target.id !== 'pi-mainland') return;
+  if(sites.length >= 9) return;
+  var p = toSvgPoint(evt);
+  if(!pointInPolygon(p.x,p.y,mainlandPts)) return;
+  sites.push([p.x,p.y]);
+  renderSites();
+  update();
+});
+
+function computeFarthest(){
+  var best = null, bestD = -1, step = 6;
+  for(var x=bbox.minX; x<=bbox.maxX; x+=step){
+    for(var y=bbox.minY; y<=bbox.maxY; y+=step){
+      if(!pointInPolygon(x,y,mainlandPts)) continue;
+      var minD = Infinity;
+      for(var k=0;k<sites.length;k++){
+        var dx = x-sites[k][0], dy = y-sites[k][1];
+        var dd = Math.sqrt(dx*dx+dy*dy);
+        if(dd<minD) minD = dd;
+      }
+      if(minD>bestD){ bestD = minD; best = [x,y]; }
+    }
+  }
+  return {point:best, dist:bestD};
+}
+
+// Clippe un polygone (tableau de [x,y]) par le demi-plan a*x + b*y <= c (Sutherland-Hodgman)
+function clipHalfPlane(poly, a, b, c){
+  if(poly.length === 0) return poly;
+  var out = [];
+  var n = poly.length;
+  for(var k=0;k<n;k++){
+    var curr = poly[k], prev = poly[(k-1+n)%n];
+    var dCurr = a*curr[0]+b*curr[1]-c;
+    var dPrev = a*prev[0]+b*prev[1]-c;
+    var currIn = dCurr <= 0;
+    var prevIn = dPrev <= 0;
+    if(currIn !== prevIn){
+      var t = dPrev/(dPrev-dCurr);
+      out.push([prev[0]+t*(curr[0]-prev[0]), prev[1]+t*(curr[1]-prev[1])]);
+    }
+    if(currIn) out.push(curr);
+  }
+  return out;
+}
+
+function voronoiCell(i){
+  // grand rectangle de depart, largement plus grand que la carte
+  var poly = [[-2000,-2000],[3000,-2000],[3000,3000],[-2000,3000]];
+  var si = sites[i];
+  for(var j=0;j<sites.length;j++){
+    if(j===i) continue;
+    var sj = sites[j];
+    var a = 2*(sj[0]-si[0]);
+    var b = 2*(sj[1]-si[1]);
+    var c = (sj[0]*sj[0]+sj[1]*sj[1]) - (si[0]*si[0]+si[1]*si[1]);
+    poly = clipHalfPlane(poly, a, b, c);
+    if(poly.length === 0) break;
+  }
+  return poly;
+}
+
+function drawVoronoi(){
+  var vGroup = document.getElementById('pi-voronoi');
+  vGroup.innerHTML = '';
+  if(sites.length < 2) return;
+  var d = '';
+  for(var i=0;i<sites.length;i++){
+    var cell = voronoiCell(i);
+    if(cell.length < 2) continue;
+    d += 'M' + cell.map(function(p){return p[0].toFixed(1)+','+p[1].toFixed(1);}).join('L') + 'Z ';
+  }
+  var path = document.createElementNS('http://www.w3.org/2000/svg','path');
+  path.setAttribute('d', d);
+  vGroup.appendChild(path);
+}
+
+function update(){
+  drawVoronoi();
+  var res = computeFarthest();
+  if(res.point){
+    document.getElementById('pi-farthest').setAttribute('cx', res.point[0]);
+    document.getElementById('pi-farthest').setAttribute('cy', res.point[1]);
+    var rad = document.getElementById('pi-radius');
+    rad.setAttribute('cx', res.point[0]);
+    rad.setAttribute('cy', res.point[1]);
+    rad.setAttribute('r', res.dist);
+    document.getElementById('pi-dist').textContent = Math.round(res.dist*2.1) + ' km (estim.)';
+  }
+}
+
+document.getElementById('pi-reset').addEventListener('click', function(){
+  sites = defaultSites.map(function(p){return p.slice();});
+  renderSites();
+  update();
+});
+
+renderSites();
+update();
+})();
+</script>
